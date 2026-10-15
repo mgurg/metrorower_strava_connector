@@ -6,10 +6,14 @@ Skrypt pobiera szczegóły przejazdów z API Nextbike i zapisuje:
 - ślad trasy w `gpx/YYYYMMDD_metrorower_<ID>.gpx`, gdzie data oznacza
   lokalną datę rozpoczęcia przejazdu w strefie `Europe/Warsaw`.
 
-Pierwszy i ostatni punkt śladu są ustawiane na współrzędne stacji z
-`resources/stations.json`. Gdy odpowiedź API zawiera numer stacji, skrypt
-używa go do dopasowania. W pozostałych przypadkach wybiera najbliższą
-stację względem współrzędnych miejsca startu/końca lub punktu trasy.
+Ślad jest przycinany do punktów najbliższych stacji startowej i końcowej
+z `resources/stations.json`. Pierwsze punkty bywają odległe od stacji, bo GPS
+nie złapał jeszcze pozycji, więc ślad zaczyna się od punktu trasy najbliższego
+stacji (szukanego w pierwszych 120 s przejazdu), a kończy na punkcie najbliższym
+stacji końcowej (w ostatnich 120 s). Na początku i końcu śladu dopisywane są
+dokładne współrzędne stacji z czasem wypożyczenia i zwrotu. Gdy odpowiedź API zawiera numer stacji, skrypt używa go do dopasowania.
+W pozostałych przypadkach wybiera najbliższą stację (do 300 m) względem
+współrzędnych miejsca startu/końca lub punktu trasy.
 Plik `resources/stations.json` zawiera wyłącznie numery i współrzędne stacji,
 bez danych o rowerach i ich bieżącej dostępności. Można wskazać inny plik
 przez `--stations`.

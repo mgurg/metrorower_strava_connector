@@ -1,0 +1,14 @@
+[project]
+name = "metrorower"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "mgurg", email = "34517378+mgurg@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+]
+
+

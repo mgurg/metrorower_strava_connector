@@ -58,3 +58,9 @@ uv run python nextbike_to_gpx.py --help
 
 Wygaśnięcie sesji jest raportowane jako błąd HTTP 401. Wtedy należy
 ponownie skopiować cookie po zalogowaniu do serwisu Nextbike.
+
+## Testy
+
+```bash
+uv run pytest
+```

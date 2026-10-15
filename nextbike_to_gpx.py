@@ -26,15 +26,17 @@ ET.register_namespace("", GPX_NAMESPACE)
 LOCAL_TIMEZONE = ZoneInfo("Europe/Warsaw")
 DEFAULT_STATIONS_PATH = Path(__file__).resolve().parent / "resources" / "stations.json"
 EARTH_RADIUS_METRES = 6_371_000
-# Places farther than this from any station are not matched to a station.
-MAX_STATION_SNAP_METRES = 300
-# Route points closest to the station are searched only this far from the track edge.
-STATION_SEARCH_SECONDS = 120
+MAX_PLACE_TO_STATION_METRES = 300
+STATION_SEARCH_WINDOW_SECONDS = 120
 
-# (lat, lng, czas ISO 8601)
-TrackPoint = tuple[float, float, str]
-# Stacje po numerze (jako tekst), każda z polami number, lat, lng.
-Stations = dict[str, dict[str, int | float]]
+Coordinates = tuple[float, float]
+StationsByNumber = dict[str, dict[str, int | float]]
+
+
+class TrackPoint(NamedTuple):
+    latitude: float
+    longitude: float
+    iso_time: str
 
 
 class Track(NamedTuple):
@@ -46,8 +48,7 @@ class Ride(NamedTuple):
     rental: dict[str, Any]
     source: str
     distance: float
-    # None dla przejazdów krótszych niż minimum.
-    track: Track | None
+    track_if_long_enough: Track | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -147,7 +148,7 @@ def valid_coordinate(latitude: Any, longitude: Any) -> bool:
     )
 
 
-def load_stations(path: Path) -> Stations:
+def load_stations(path: Path) -> StationsByNumber:
     data = load_json(path)
     if not isinstance(data, list) or not data:
         raise ValueError(f"Plik {path} nie zawiera listy stacji")
@@ -204,7 +205,6 @@ def iso_time_from_milliseconds(timestamp: float) -> str:
 
 
 def rental_time(rental: dict[str, Any], field: str, fallback: str) -> str:
-    """Czas z pola rental w formacie śladu; fallback, gdy pola brak."""
     seconds = rental.get(field)
     if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
         return fallback
@@ -244,7 +244,7 @@ def parse_route_points(rental: dict[str, Any]) -> list[TrackPoint]:
 
     parsed_points.sort(key=lambda point: point[2])
     return [
-        (latitude, longitude, iso_time_from_milliseconds(timestamp))
+        TrackPoint(latitude, longitude, iso_time_from_milliseconds(timestamp))
         for latitude, longitude, timestamp in parsed_points
     ]
 
@@ -252,7 +252,6 @@ def parse_route_points(rental: dict[str, Any]) -> list[TrackPoint]:
 def validate_rental(
     rental: dict[str, Any], minimum_metres: float
 ) -> tuple[float, Track | None]:
-    """Zwraca dystans i trasę; trasa jest None dla zbyt krótkich przejazdów."""
     distance = rental.get("distance")
     if not isinstance(distance, (int, float)):
         raise ValueError("odpowiedź nie zawiera liczbowego pola distance")
@@ -264,7 +263,6 @@ def validate_rental(
 def load_ride(
     client: httpx.Client, json_path: Path, rental_id: str, minimum_metres: float
 ) -> Ride:
-    """Czyta przejazd z cache'u, a gdy go brak lub jest błędny — z API."""
     if json_path.exists():
         try:
             rental = load_json(json_path)
@@ -278,15 +276,14 @@ def load_ride(
             )
 
     rental = fetch_rental(client, rental_id)
-    # Validate before caching so a bad response is retried next run.
     ride = Ride(rental, "API", *validate_rental(rental, minimum_metres))
     save_json(json_path, rental)
     return ride
 
 
 def station_location(
-    place: Any, route_point: TrackPoint, stations: Stations
-) -> tuple[float, float] | None:
+    place: Any, route_point: TrackPoint, stations: StationsByNumber
+) -> Coordinates | None:
     place = place if isinstance(place, dict) else {}
     named_station = stations.get(str(place.get("name")))
     if named_station is not None:
@@ -299,7 +296,7 @@ def station_location(
     distance, nearest = min(
         (
             (
-                distance_metres(
+                equirectangular_distance_metres(
                     (latitude, longitude), (station["lat"], station["lng"])
                 ),
                 station,
@@ -308,46 +305,75 @@ def station_location(
         ),
         key=lambda pair: pair[0],
     )
-    if distance > MAX_STATION_SNAP_METRES:
+    if distance > MAX_PLACE_TO_STATION_METRES:
         return None
     return float(nearest["lat"]), float(nearest["lng"])
 
 
-def distance_metres(a: tuple[float, float], b: tuple[float, float]) -> float:
-    # Equirectangular distance is sufficient at the scale of a city.
+def equirectangular_distance_metres(a: Coordinates, b: Coordinates) -> float:
     cos_latitude = math.cos(math.radians(a[0]))
     return EARTH_RADIUS_METRES * math.hypot(
         math.radians(b[0] - a[0]), cos_latitude * math.radians(b[1] - a[1])
     )
 
 
-def nearest_point_index(
-    route_points: list[TrackPoint],
-    indices: range,
-    station: tuple[float, float] | None,
-) -> int:
-    """Indeks punktu najbliższego stacji wśród punktów z początku zakresu.
-
-    Pierwszy zapisany punkt bywa odległy (GPS nie złapał jeszcze pozycji),
-    więc ślad zaczyna się od punktu najbliższego stacji. Szukamy tylko w oknie
-    STATION_SEARCH_SECONDS, żeby przejazd wracający pod stację nie został ucięty.
-    """
-    if station is None:
-        return indices[0]
-    edge_time = datetime.fromisoformat(route_points[indices[0]][2])
-    candidates = [
-        index
-        for index in indices
-        if abs(
-            (datetime.fromisoformat(route_points[index][2]) - edge_time).total_seconds()
-        )
-        <= STATION_SEARCH_SECONDS
-    ]
-    # Przy remisie min() wybiera punkt najbliższy krawędzi, czyli ucina najmniej.
-    return min(
-        candidates,
-        key=lambda index: distance_metres(route_points[index][:2], station),
+def seconds_between(a: TrackPoint, b: TrackPoint) -> float:
+    return abs(
+        (
+            datetime.fromisoformat(b.iso_time) - datetime.fromisoformat(a.iso_time)
+        ).total_seconds()
     )
+
+
+def index_closest_to_station_near_edge(
+    route_points: list[TrackPoint],
+    indices_from_edge: range,
+    station: Coordinates | None,
+) -> int:
+    edge_index = indices_from_edge[0]
+    if station is None:
+        return edge_index
+    indices_within_window = [
+        index
+        for index in indices_from_edge
+        if seconds_between(route_points[edge_index], route_points[index])
+        <= STATION_SEARCH_WINDOW_SECONDS
+    ]
+    return min(
+        indices_within_window,
+        key=lambda index: equirectangular_distance_metres(
+            route_points[index][:2], station
+        ),
+    )
+
+
+def build_track_points(
+    rental: dict[str, Any],
+    route_points: list[TrackPoint],
+    stations: StationsByNumber,
+) -> list[TrackPoint]:
+    start_station = station_location(
+        rental.get("startPlace"), route_points[0], stations
+    )
+    end_station = station_location(rental.get("endPlace"), route_points[-1], stations)
+
+    indices = range(len(route_points))
+    first = index_closest_to_station_near_edge(route_points, indices, start_station)
+    last = index_closest_to_station_near_edge(route_points, indices[::-1], end_station)
+    windows_overlap = first > last
+    if windows_overlap:
+        first, last = 0, len(route_points) - 1
+    track_points = route_points[first : last + 1]
+
+    if start_station is not None:
+        first_time = track_points[0].iso_time
+        start_time = min(rental_time(rental, "startTime", first_time), first_time)
+        track_points.insert(0, TrackPoint(*start_station, start_time))
+    if end_station is not None:
+        last_time = track_points[-1].iso_time
+        end_time = max(rental_time(rental, "endTime", last_time), last_time)
+        track_points.append(TrackPoint(*end_station, end_time))
+    return track_points
 
 
 def write_gpx(
@@ -355,33 +381,8 @@ def write_gpx(
     rental: dict[str, Any],
     rental_id: str,
     distance: float,
-    route_points: list[TrackPoint],
-    stations: Stations,
+    track_points: list[TrackPoint],
 ) -> int:
-    start_station = station_location(
-        rental.get("startPlace"), route_points[0], stations
-    )
-    end_station = station_location(rental.get("endPlace"), route_points[-1], stations)
-
-    indices = range(len(route_points))
-    first = nearest_point_index(route_points, indices, start_station)
-    last = nearest_point_index(route_points, indices[::-1], end_station)
-    # Krótka trasa może mieć oba okna nachodzące na siebie.
-    if first > last:
-        first, last = 0, len(route_points) - 1
-    track_points = route_points[first : last + 1]
-
-    # Dokładne położenie stacji jako punkt startu i końca, w czasie wypożyczenia
-    # i zwrotu; min/max zachowuje rosnącą kolejność czasów w śladzie.
-    if start_station is not None:
-        first_time = track_points[0][2]
-        start_time = min(rental_time(rental, "startTime", first_time), first_time)
-        track_points.insert(0, (*start_station, start_time))
-    if end_station is not None:
-        last_time = track_points[-1][2]
-        end_time = max(rental_time(rental, "endTime", last_time), last_time)
-        track_points.append((*end_station, end_time))
-
     name = f"Nextbike {rental_id}"
     gpx = ET.Element(
         f"{{{GPX_NAMESPACE}}}gpx",
@@ -475,7 +476,7 @@ def main() -> int:
                 )
                 sources[ride.source] += 1
 
-                if ride.track is None:
+                if ride.track_if_long_enough is None:
                     too_short += 1
                     print(
                         f"[{rental_id}] odrzucony: {ride.distance / 1000:.2f} km "
@@ -483,14 +484,17 @@ def main() -> int:
                     )
                     continue
 
-                gpx_path = args.gpx_dir / gpx_filename(ride.track.date, rental_id)
+                gpx_path = args.gpx_dir / gpx_filename(
+                    ride.track_if_long_enough.date, rental_id
+                )
                 point_count = write_gpx(
                     gpx_path,
                     ride.rental,
                     rental_id,
                     ride.distance,
-                    ride.track.route_points,
-                    stations,
+                    build_track_points(
+                        ride.rental, ride.track_if_long_enough.route_points, stations
+                    ),
                 )
                 created += 1
                 print(

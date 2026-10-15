@@ -64,3 +64,14 @@ ponownie skopiować cookie po zalogowaniu do serwisu Nextbike.
 ```bash
 uv run pytest
 ```
+
+## Struktura kodu
+
+- `nextbike_to_gpx.py` — punkt wejścia,
+- `metrorower/cli.py` — argumenty i przebieg eksportu,
+- `metrorower/nextbike.py` — API Nextbike i cache odpowiedzi,
+- `metrorower/models.py` — typy danych i walidacja wartości,
+- `metrorower/stations.py` — stacje i odległości,
+- `metrorower/track.py` — przycinanie śladu i punkty stacji,
+- `metrorower/gpx.py` — zapis plików GPX,
+- `metrorower/files.py` — odczyt i atomowy zapis plików.

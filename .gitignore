@@ -9,6 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
+# Tool caches and reports
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 # IDE
 .idea
 

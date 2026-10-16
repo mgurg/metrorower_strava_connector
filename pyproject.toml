@@ -3,6 +3,9 @@ name = "metrorower"
 version = "0.1.0"
 description = "Eksport przejazdów Nextbike (Metrorower) do plików GPX"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["nextbike", "metrorower", "gpx", "cycling", "strava"]
 authors = [
     { name = "mgurg", email = "34517378+mgurg@users.noreply.github.com" }
 ]

@@ -1,6 +1,10 @@
+from dataclasses import replace
+
 import pytest
 
-from metrorower.stations import equirectangular_distance_metres
+from metrorower.errors import InvalidRentalData
+from metrorower.geo import Coordinates, distance_meters
+from metrorower.models import Place
 from metrorower.track import STATION_SEARCH_WINDOW_SECONDS, build_track_points
 
 
@@ -17,7 +21,7 @@ def test_points_recorded_before_reaching_closest_to_start_station_are_dropped(
         scenario.point_north_of(end, 12, 990),
     ]
 
-    track = build_track_points(scenario.rental(), route, scenario.stations)
+    track = build_track_points(scenario.rental(route), scenario.stations)
 
     assert track == [
         scenario.point_at(start, -10),
@@ -38,7 +42,7 @@ def test_points_recorded_after_closest_to_end_station_are_dropped(scenario):
         *waiting_at_dock,
     ]
 
-    track = build_track_points(scenario.rental(), route, scenario.stations)
+    track = build_track_points(scenario.rental(route), scenario.stations)
 
     assert track[-2] == closest_to_end_station
 
@@ -58,7 +62,7 @@ def test_loop_ride_passing_start_station_after_search_window_keeps_whole_route(
         scenario.point_north_of(start, 20, 990),
     ]
 
-    track = build_track_points(scenario.loop_rental(), route, scenario.stations)
+    track = build_track_points(scenario.loop_rental(route), scenario.stations)
 
     assert track == [
         scenario.point_at(start, -10),
@@ -68,17 +72,20 @@ def test_loop_ride_passing_start_station_after_search_window_keeps_whole_route(
 
 
 def test_route_without_matching_station_is_left_unchanged(scenario):
-    far_from_any_station = (scenario.start_station[0] + 0.1, scenario.start_station[1])
+    far_from_any_station = Coordinates(
+        scenario.start_station.latitude + 0.1, scenario.start_station.longitude
+    )
     route = [
         scenario.point_at(far_from_any_station, 0),
         scenario.point_north_of(far_from_any_station, 100, 30),
     ]
-    rental_from_unknown_place = scenario.rental() | {
-        "startPlace": scenario.place("999", far_from_any_station),
-        "endPlace": {},
-    }
+    rental_from_unknown_place = replace(
+        scenario.rental(route),
+        start_place=Place("999", far_from_any_station),
+        end_place=Place(),
+    )
 
-    track = build_track_points(rental_from_unknown_place, route, scenario.stations)
+    track = build_track_points(rental_from_unknown_place, scenario.stations)
 
     assert track == route
 
@@ -86,9 +93,9 @@ def test_route_without_matching_station_is_left_unchanged(scenario):
 def test_single_route_point_lies_between_both_stations(scenario):
     start, end = scenario.start_station, scenario.end_station
     route = [scenario.point_north_of(start, 20, 0)]
-    rental = scenario.rental(returned_after_seconds=20)
+    rental = scenario.rental(route, returned_after_seconds=20)
 
-    track = build_track_points(rental, route, scenario.stations)
+    track = build_track_points(rental, scenario.stations)
 
     assert track == [
         scenario.point_at(start, -10),
@@ -97,34 +104,37 @@ def test_single_route_point_lies_between_both_stations(scenario):
     ]
 
 
-@pytest.mark.parametrize("missing_field", [None, "startTime", "endTime"])
-def test_station_points_never_break_time_order(scenario, missing_field):
+@pytest.mark.parametrize(
+    "returned_after_seconds",
+    [985, None],
+    ids=["returned-before-last-fix", "no-end-time"],
+)
+def test_station_points_never_break_time_order(scenario, returned_after_seconds):
     start, end = scenario.start_station, scenario.end_station
     route = [
         scenario.point_north_of(start, 10, 0),
         *scenario.points_halfway_between_stations(2),
         scenario.point_north_of(end, 10, 990),
     ]
-    rented_after_first_fix_and_returned_before_last = scenario.rental(
-        rented_after_seconds=5, returned_after_seconds=985
-    )
-    rented_after_first_fix_and_returned_before_last.pop(missing_field, None)
-
-    track = build_track_points(
-        rented_after_first_fix_and_returned_before_last, route, scenario.stations
+    rented_after_first_fix = scenario.rental(
+        route,
+        rented_after_seconds=5,
+        returned_after_seconds=returned_after_seconds,
     )
 
-    assert track[0].iso_time == route[0].iso_time
-    assert track[-1].iso_time == route[-1].iso_time
-    times = [point.iso_time for point in track]
+    track = build_track_points(rented_after_first_fix, scenario.stations)
+
+    assert track[0].time == route[0].time
+    assert track[-1].time == route[-1].time
+    times = [point.time for point in track]
     assert times == sorted(times)
 
 
-def test_equirectangular_distance_matches_metres_moved_north(scenario):
+def test_distance_matches_meters_moved_north(scenario):
     start = scenario.start_station
-    hundred_metres_north = scenario.point_north_of(start, 100, 0)[:2]
+    hundred_meters_north = scenario.point_north_of(start, 100, 0).coordinates
 
-    distance = equirectangular_distance_metres(start, hundred_metres_north)
+    distance = distance_meters(start, hundred_meters_north)
 
     assert distance == pytest.approx(100, abs=0.5)
 
@@ -138,12 +148,17 @@ def test_short_ride_recorded_from_end_station_towards_start_keeps_whole_route(
         scenario.point_north_of(start, 2000, 10),
         scenario.point_north_of(start, 10, 20),
     ]
-    rental = scenario.rental(returned_after_seconds=30)
+    rental = scenario.rental(route, returned_after_seconds=30)
 
-    track = build_track_points(rental, route, scenario.stations)
+    track = build_track_points(rental, scenario.stations)
 
     assert track == [
         scenario.point_at(start, -10),
         *route,
         scenario.point_at(end, 30),
     ]
+
+
+def test_rental_without_route_points_has_no_track(scenario):
+    with pytest.raises(InvalidRentalData, match="routePoints"):
+        build_track_points(scenario.rental([]), scenario.stations)

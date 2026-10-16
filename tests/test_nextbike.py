@@ -1,132 +1,131 @@
-import json
+from datetime import UTC, date, datetime
 
 import httpx
 import pytest
 
-from metrorower.models import TrackPoint
-from metrorower.nextbike import load_ride, parse_route_points, validate_rental
+from metrorower.errors import (
+    InvalidRentalData,
+    NetworkError,
+    NextbikeApiError,
+    SessionExpired,
+)
+from metrorower.geo import Coordinates
+from metrorower.models import Place, TrackPoint
+from metrorower.nextbike import parse_rental
 
 RENTAL_ID = "360039555"
 
 
-def fail_if_called(request: httpx.Request) -> httpx.Response:
-    raise AssertionError(f"nieoczekiwane zapytanie do API: {request.url}")
+def test_route_points_are_sorted_by_time(api_rental):
+    rental = parse_rental(
+        api_rental(
+            routePoints=[
+                {"lat": 50.2, "lng": 19.2, "ts": 1_788_959_284_487},
+                {"lat": 50.1, "lng": 19.1, "ts": 1_788_959_259_526},
+            ]
+        ),
+        RENTAL_ID,
+    )
 
-
-def test_route_points_are_sorted_by_time_and_converted_to_iso():
-    rental = {
-        "routePoints": [
-            {"lat": 50.2, "lng": 19.2, "ts": 1_788_959_284_487},
-            {"lat": 50.1, "lng": 19.1, "ts": 1_788_959_259_526},
-        ]
-    }
-
-    assert parse_route_points(rental) == [
-        TrackPoint(50.1, 19.1, "2026-09-09T13:07:39.526Z"),
-        TrackPoint(50.2, 19.2, "2026-09-09T13:08:04.487Z"),
-    ]
+    assert rental.route_points == (
+        TrackPoint(50.1, 19.1, datetime(2026, 9, 9, 13, 7, 39, 526_000, tzinfo=UTC)),
+        TrackPoint(50.2, 19.2, datetime(2026, 9, 9, 13, 8, 4, 487_000, tzinfo=UTC)),
+    )
 
 
 @pytest.mark.parametrize(
     "route_points",
     [
-        [],
-        None,
+        {"lat": 50.1},
         [{"lat": 91, "lng": 19.1, "ts": 0}],
         [{"lat": 50.1, "lng": 19.1}],
         [{"lat": "abc", "lng": 19.1, "ts": 0}],
     ],
-    ids=["empty", "missing", "latitude-out-of-range", "no-time", "not-a-number"],
+    ids=["not-a-list", "latitude-out-of-range", "no-time", "not-a-number"],
 )
-def test_invalid_route_points_are_rejected(route_points):
-    with pytest.raises(ValueError, match="routePoints"):
-        parse_route_points({"routePoints": route_points})
+def test_invalid_route_points_are_rejected(api_rental, route_points):
+    with pytest.raises(InvalidRentalData, match="routePoints"):
+        parse_rental(api_rental(routePoints=route_points), RENTAL_ID)
 
 
-def test_ride_shorter_than_minimum_has_no_track_and_needs_no_route_points():
-    distance, track = validate_rental({"distance": 999}, minimum_metres=1000)
+def test_rental_without_route_points_is_parsed_with_empty_route(api_rental):
+    rental = parse_rental(api_rental(distance=999, routePoints=None), RENTAL_ID)
 
-    assert (distance, track) == (999, None)
-
-
-@pytest.mark.parametrize("distance", [None, "4000", True])
-def test_non_numeric_distance_is_rejected(distance):
-    with pytest.raises(ValueError, match="distance"):
-        validate_rental({"distance": distance}, minimum_metres=1000)
+    assert rental.route_points == ()
 
 
-def test_track_date_uses_warsaw_time_not_utc(api_rental):
+@pytest.mark.parametrize("field", ["distance", "startTime"])
+@pytest.mark.parametrize("value", [None, "4000", True])
+def test_non_numeric_required_field_is_rejected(api_rental, field, value):
+    with pytest.raises(InvalidRentalData, match=field):
+        parse_rental(api_rental(**{field: value}), RENTAL_ID)
+
+
+@pytest.mark.parametrize("data", [[], "text", None])
+def test_response_other_than_object_is_rejected(data):
+    with pytest.raises(InvalidRentalData):
+        parse_rental(data, RENTAL_ID)
+
+
+def test_places_and_bike_are_parsed(api_rental):
+    rental = parse_rental(
+        api_rental(
+            startPlace={"name": 27163, "lat": 50.26, "lng": 19.01},
+            endPlace={"lat": "x"},
+            bike={"number": 583444},
+        ),
+        RENTAL_ID,
+    )
+
+    assert rental.start_place == Place("27163", Coordinates(50.26, 19.01))
+    assert rental.end_place == Place()
+    assert rental.bike_number == "583444"
+
+
+def test_start_date_uses_warsaw_time_not_utc(api_rental):
     late_evening_utc_is_next_day_in_warsaw = 1_788_996_600
 
-    _, track = validate_rental(
-        api_rental(startTime=late_evening_utc_is_next_day_in_warsaw), minimum_metres=0
+    rental = parse_rental(
+        api_rental(startTime=late_evening_utc_is_next_day_in_warsaw), RENTAL_ID
     )
 
-    assert track is not None
-    assert track.date == "20260910"
+    assert rental.local_start_date == date(2026, 9, 10)
 
 
-def test_valid_cache_is_used_without_calling_api(tmp_path, api_rental, nextbike_api):
-    cache = tmp_path / f"{RENTAL_ID}.json"
-    cache.write_text(json.dumps(api_rental()), encoding="utf-8")
-
-    ride = load_ride(nextbike_api(fail_if_called), cache, RENTAL_ID, 1000)
-
-    assert ride.source == "cache"
-    assert ride.track_if_long_enough is not None
-
-
-@pytest.mark.parametrize("cache_content", ["{broken json", "[]", '{"distance": "x"}'])
-def test_invalid_cache_is_downloaded_again_and_replaced(
-    tmp_path, api_rental, nextbike_api, cache_content
-):
-    cache = tmp_path / f"{RENTAL_ID}.json"
-    cache.write_text(cache_content, encoding="utf-8")
-    fresh_rental = api_rental()
-
-    ride = load_ride(
-        nextbike_api(lambda request: httpx.Response(200, json=fresh_rental)),
-        cache,
-        RENTAL_ID,
-        1000,
-    )
-
-    assert ride.source == "API"
-    assert json.loads(cache.read_text(encoding="utf-8")) == fresh_rental
-
-
-def test_downloaded_ride_is_requested_by_id_and_cached(
-    tmp_path, api_rental, nextbike_api
-):
-    requested_ids = []
+def test_rental_is_requested_by_id(nextbike_api, api_rental):
+    requested = []
 
     def api(request: httpx.Request) -> httpx.Response:
-        requested_ids.append(json.loads(request.content)["id"])
+        requested.append(request.read())
         return httpx.Response(200, json=api_rental())
 
-    cache = tmp_path / f"{RENTAL_ID}.json"
-    load_ride(nextbike_api(api), cache, RENTAL_ID, 1000)
-
-    assert requested_ids == [RENTAL_ID]
-    assert cache.exists()
+    assert nextbike_api(api).fetch(RENTAL_ID) == api_rental()
+    assert requested == [f'{{"id":"{RENTAL_ID}"}}'.encode()]
 
 
-def test_invalid_api_response_is_not_cached(tmp_path, nextbike_api):
-    cache = tmp_path / f"{RENTAL_ID}.json"
+def test_unauthorized_response_means_expired_session(nextbike_api):
+    with pytest.raises(SessionExpired, match="cookie"):
+        nextbike_api(lambda request: httpx.Response(401)).fetch(RENTAL_ID)
 
-    with pytest.raises(ValueError):
-        load_ride(
-            nextbike_api(lambda request: httpx.Response(200, json={"distance": None})),
-            cache,
-            RENTAL_ID,
-            1000,
+
+def test_other_http_error_reports_status(nextbike_api):
+    with pytest.raises(NextbikeApiError, match="HTTP 500") as error:
+        nextbike_api(lambda request: httpx.Response(500)).fetch(RENTAL_ID)
+
+    assert not isinstance(error.value, SessionExpired)
+
+
+def test_connection_failure_is_network_error(nextbike_api):
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(NetworkError):
+        nextbike_api(unreachable).fetch(RENTAL_ID)
+
+
+@pytest.mark.parametrize("content", [b"<html>", b"[]"], ids=["not-json", "not-object"])
+def test_unexpected_api_body_is_invalid_rental_data(nextbike_api, content):
+    with pytest.raises(InvalidRentalData):
+        nextbike_api(lambda request: httpx.Response(200, content=content)).fetch(
+            RENTAL_ID
         )
-
-    assert not cache.exists()
-
-
-def test_expired_cookie_raises_http_error(tmp_path, nextbike_api):
-    unauthorized = nextbike_api(lambda request: httpx.Response(401))
-
-    with pytest.raises(httpx.HTTPStatusError):
-        load_ride(unauthorized, tmp_path / f"{RENTAL_ID}.json", RENTAL_ID, 1000)

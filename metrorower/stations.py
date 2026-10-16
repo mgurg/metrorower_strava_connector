@@ -1,76 +1,78 @@
 from __future__ import annotations
 
-import math
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from metrorower.errors import InvalidFileError
 from metrorower.files import load_json
-from metrorower.models import (
+from metrorower.geo import (
     Coordinates,
-    StationsByNumber,
-    TrackPoint,
-    as_coordinates,
-    is_integer,
-    valid_coordinate,
+    distance_meters,
+    parse_coordinates,
 )
+from metrorower.models import Place
 
-DEFAULT_STATIONS_PATH = (
-    Path(__file__).resolve().parent.parent / "resources" / "stations.json"
-)
-EARTH_RADIUS_METRES = 6_371_000
-MAX_PLACE_TO_STATION_METRES = 300
+STATIONS_PATH = Path(__file__).resolve().parent / "resources" / "stations.json"
+MAX_PLACE_TO_STATION_METERS = 300
 
 
-def valid_station(station: Any) -> bool:
-    return (
-        isinstance(station, dict)
-        and is_integer(station.get("number"))
-        and valid_coordinate(station.get("lat"), station.get("lng"))
-    )
+@dataclass(frozen=True)
+class Station:
+    number: int
+    location: Coordinates
 
 
-def load_stations(path: Path) -> StationsByNumber:
+class Stations:
+    def __init__(self, stations: Iterable[Station]) -> None:
+        self._by_number = {str(station.number): station for station in stations}
+
+    def __len__(self) -> int:
+        return len(self._by_number)
+
+    def __getitem__(self, number: str) -> Station:
+        return self._by_number[number]
+
+    def locate(self, place: Place, fallback: Coordinates) -> Coordinates | None:
+        named_station = self._by_number.get(place.station_number or "")
+        if named_station is not None:
+            return named_station.location
+        return self.nearest_within(
+            place.location or fallback, MAX_PLACE_TO_STATION_METERS
+        )
+
+    def nearest_within(
+        self, location: Coordinates, max_meters: float
+    ) -> Coordinates | None:
+        distance, nearest = min(
+            (
+                (distance_meters(location, station.location), station)
+                for station in self._by_number.values()
+            ),
+            key=lambda pair: pair[0],
+        )
+        return nearest.location if distance <= max_meters else None
+
+
+def parse_station(raw: Any) -> Station | None:
+    if not isinstance(raw, dict):
+        return None
+    number = raw.get("number")
+    location = parse_coordinates(raw.get("lat"), raw.get("lng"))
+    if not isinstance(number, int) or isinstance(number, bool) or location is None:
+        return None
+    return Station(number, location)
+
+
+def load_stations(path: Path) -> Stations:
     data = load_json(path)
     if not isinstance(data, list) or not data:
-        raise ValueError(f"Plik {path} nie zawiera listy stacji")
-    for index, station in enumerate(data, start=1):
-        if not valid_station(station):
-            raise ValueError(f"Nieprawidłowa stacja #{index} w {path}")
-    return {str(station["number"]): station for station in data}
-
-
-def equirectangular_distance_metres(a: Coordinates, b: Coordinates) -> float:
-    cos_latitude = math.cos(math.radians(a[0]))
-    return EARTH_RADIUS_METRES * math.hypot(
-        math.radians(b[0] - a[0]), cos_latitude * math.radians(b[1] - a[1])
-    )
-
-
-def station_location(
-    place: Any, route_point: TrackPoint, stations: StationsByNumber
-) -> Coordinates | None:
-    place = place if isinstance(place, dict) else {}
-    named_station = stations.get(str(place.get("name")))
-    if named_station is not None:
-        return float(named_station["lat"]), float(named_station["lng"])
-
-    location = as_coordinates(place.get("lat"), place.get("lng")) or (
-        route_point.latitude,
-        route_point.longitude,
-    )
-
-    distance, nearest = min(
-        (
-            (
-                equirectangular_distance_metres(
-                    location, (station["lat"], station["lng"])
-                ),
-                station,
-            )
-            for station in stations.values()
-        ),
-        key=lambda pair: pair[0],
-    )
-    if distance > MAX_PLACE_TO_STATION_METRES:
-        return None
-    return float(nearest["lat"]), float(nearest["lng"])
+        raise InvalidFileError(f"Plik {path} nie zawiera listy stacji")
+    stations: list[Station] = []
+    for index, raw in enumerate(data, start=1):
+        station = parse_station(raw)
+        if station is None:
+            raise InvalidFileError(f"Nieprawidłowa stacja #{index} w {path}")
+        stations.append(station)
+    return Stations(stations)

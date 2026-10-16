@@ -1,20 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any
-
-from metrorower.models import Coordinates, StationsByNumber, TrackPoint, rental_time
-from metrorower.stations import equirectangular_distance_metres, station_location
+from metrorower.errors import InvalidRentalData
+from metrorower.geo import Coordinates, distance_meters
+from metrorower.models import Rental, TrackPoint
+from metrorower.stations import Stations
 
 STATION_SEARCH_WINDOW_SECONDS = 120
 
 
 def seconds_between(a: TrackPoint, b: TrackPoint) -> float:
-    return abs(
-        (
-            datetime.fromisoformat(b.iso_time) - datetime.fromisoformat(a.iso_time)
-        ).total_seconds()
-    )
+    return abs((b.time - a.time).total_seconds())
 
 
 def index_closest_to_station_near_edge(
@@ -33,21 +28,17 @@ def index_closest_to_station_near_edge(
     ]
     return min(
         indices_within_window,
-        key=lambda index: equirectangular_distance_metres(
-            route_points[index][:2], station
-        ),
+        key=lambda index: distance_meters(route_points[index].coordinates, station),
     )
 
 
-def build_track_points(
-    rental: dict[str, Any],
-    route_points: list[TrackPoint],
-    stations: StationsByNumber,
-) -> list[TrackPoint]:
-    start_station = station_location(
-        rental.get("startPlace"), route_points[0], stations
-    )
-    end_station = station_location(rental.get("endPlace"), route_points[-1], stations)
+def build_track_points(rental: Rental, stations: Stations) -> list[TrackPoint]:
+    route_points = list(rental.route_points)
+    if not route_points:
+        raise InvalidRentalData("brak punktów routePoints")
+
+    start_station = stations.locate(rental.start_place, route_points[0].coordinates)
+    end_station = stations.locate(rental.end_place, route_points[-1].coordinates)
 
     indices = range(len(route_points))
     first = index_closest_to_station_near_edge(route_points, indices, start_station)
@@ -58,11 +49,10 @@ def build_track_points(
     track_points = route_points[first : last + 1]
 
     if start_station is not None:
-        first_time = track_points[0].iso_time
-        start_time = min(rental_time(rental, "startTime", first_time), first_time)
+        start_time = min(rental.start_time, track_points[0].time)
         track_points.insert(0, TrackPoint(*start_station, start_time))
     if end_station is not None:
-        last_time = track_points[-1].iso_time
-        end_time = max(rental_time(rental, "endTime", last_time), last_time)
+        last_time = track_points[-1].time
+        end_time = max(rental.end_time or last_time, last_time)
         track_points.append(TrackPoint(*end_station, end_time))
     return track_points
